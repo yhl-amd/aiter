@@ -218,6 +218,21 @@ DINLINE void end_sync(const RankSignals& sg,
     // visible. Note that I did not managed to make this happen through a lot of
     // testing. Might be the case that hardware provides stronger guarantee than
     // the memory model.
+    //
+    // A release store by only the signal threads is not sufficient to flush
+    // peer-memory stores issued by every thread in the block on ROCm.  In the
+    // 2-stage fused AllReduce+RMSNorm path this allowed peers to observe the end
+    // flag and launch stage 2 while a subset of the stage-1 IPC tmp writes was
+    // still not visible.  Make all block threads publish their prior global
+    // writes at system scope before any end flag can be released.
+    if constexpr(!final_sync)
+    {
+        __threadfence_system();
+        // __threadfence_system() only orders writes issued by the calling
+        // thread.  Do not let the signal wave publish completion until every
+        // writer thread in the block has completed its system-scope fence.
+        __syncthreads();
+    }
     uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
     if(threadIdx.x < ngpus)
     {
@@ -230,7 +245,8 @@ DINLINE void end_sync(const RankSignals& sg,
         // wait until we got true from all ranks
         while(__scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
                                      final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
+                                     final_sync ? __MEMORY_SCOPE_DEVICE
+                                                : __MEMORY_SCOPE_SYSTEM) < flag)
             ;
     }
     __syncthreads();
