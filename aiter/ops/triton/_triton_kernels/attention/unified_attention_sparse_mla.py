@@ -45,11 +45,15 @@ def _kernel_unified_attention_sparse_mla_2d(
     key_cache_ptr,  # [num_blks, blk_size, 1, KV_LORA_RANK + ROPE_RANK]
     value_cache_ptr,  # [num_blks, blk_size, 1, KV_LORA_RANK]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
-    topk_indices_ptr,  # [num_tokens, topk]
+    topk_indices_ptr,  # [num_tokens, topk] or flat CSR entries
+    topk_indptr_ptr,  # optional [num_tokens + 1] CSR offsets
     seq_lens_ptr,  # [num_seqs]
     scale,  # float32
+    q_scale_ptr,  # optional float32 scalar
+    kv_scale_ptr,  # optional float32 scalar
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
+    NUM_HEAD_BLOCKS: tl.constexpr,  # int
     block_table_stride: tl.int64,  # int
     query_stride_0: tl.int64,  # int
     query_stride_1: tl.int64,  # int
@@ -74,9 +78,7 @@ def _kernel_unified_attention_sparse_mla_2d(
     ALL_DECODE: tl.constexpr = False,
 ):
     """
-    TODO:
-    -- Masking can be simplified
-    -- Tests fail when all topk indices are all -1, not likely to be the case in practice
+    TODO: Masking can be simplified.
     """
     # only one query per program
     # these can be removed but keeps the kernel similar to the MHA way
@@ -84,8 +86,8 @@ def _kernel_unified_attention_sparse_mla_2d(
     kv_head_idx = 0  # assume there is single kv head
 
     q_block_global_idx = tl.program_id(0)
-    q_ind = q_block_global_idx // (num_query_heads // BLOCK_M)
-    head_ind = q_block_global_idx % (num_query_heads // BLOCK_M)
+    q_ind = q_block_global_idx // NUM_HEAD_BLOCKS
+    head_ind = q_block_global_idx % NUM_HEAD_BLOCKS
     seq_idx = find_seq_idx(query_start_len_ptr, q_ind, num_seqs, BLOCK_Q, False)
     q_block_start_idx = tl.load(query_start_len_ptr + seq_idx)
 
@@ -96,6 +98,15 @@ def _kernel_unified_attention_sparse_mla_2d(
 
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
+
+    qk_factor: tl.float32 = scale
+    if q_scale_ptr is not None:
+        qk_factor *= tl.load(q_scale_ptr)
+    if kv_scale_ptr is not None:
+        kv_scale = tl.load(kv_scale_ptr)
+        qk_factor *= kv_scale
+    else:
+        kv_scale = None
 
     offs_m = tl.arange(0, BLOCK_M) + head_ind * BLOCK_M
 
@@ -144,10 +155,8 @@ def _kernel_unified_attention_sparse_mla_2d(
     )
 
     M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
-    L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    L = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, KV_LORA_RANK], dtype=tl.float32)
-
-    seq_idx * block_table_stride
 
     # iterate topk indices in tiles of TILE_SIZE
     num_tiles = (topk_count + TILE_SIZE - 1) // TILE_SIZE
@@ -157,9 +166,19 @@ def _kernel_unified_attention_sparse_mla_2d(
         offs_t = tl.arange(0, TILE_SIZE)
         valid_t = (tile_start + offs_t) < topk_count
 
-        # load top-k token positions for this query
-        topk_row_ptr = topk_indices_ptr + q_ind * topk_count
-        topk_pos = tl.load(topk_row_ptr + tile_start + offs_t, mask=valid_t, other=0)
+        # Load top-k token positions for this query.  Production GLM uses a
+        # ragged CSR stream; the original public wrapper uses fixed 2-D rows.
+        if topk_indptr_ptr is not None:
+            topk_row_start = tl.load(topk_indptr_ptr + q_ind)
+            topk_row_end = tl.load(topk_indptr_ptr + q_ind + 1)
+            valid_t &= (tile_start + offs_t) < (topk_row_end - topk_row_start)
+        else:
+            topk_row_start = q_ind * topk_count
+        topk_pos = tl.load(
+            topk_indices_ptr + topk_row_start + tile_start + offs_t,
+            mask=valid_t,
+            other=0,
+        )
         # ignore -1, means not valid
         valid_t = valid_t & (topk_pos != -1)
 
@@ -185,7 +204,7 @@ def _kernel_unified_attention_sparse_mla_2d(
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
-        S += scale * tl.dot(Q_rope, K_rope)
+        S += tl.dot(Q_rope, K_rope)
         # K_lora: (KV_LORA_RANK, TILE_SIZE)
         k_lora_ptrs = (
             key_cache_ptr
@@ -201,7 +220,8 @@ def _kernel_unified_attention_sparse_mla_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        S += scale * tl.dot(Q_lora, K_lora)
+        S += tl.dot(Q_lora, K_lora)
+        S *= qk_factor
 
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & valid_t[None, :],
@@ -210,10 +230,13 @@ def _kernel_unified_attention_sparse_mla_2d(
         )
 
         m_j = tl.maximum(M, tl.max(S, axis=1))
-        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
-        P = tl.exp(S - m_j[:, None])
+        # Keep M at -inf for an entirely invalid tile, but use a finite value
+        # in exp() to avoid (-inf)-(-inf).  This lets a later valid tile start
+        # the online softmax from a clean state and makes all-invalid rows 0.
+        safe_m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+        P = tl.exp(S - safe_m_j[:, None])
         l_j = tl.sum(P, axis=1)
-        alpha = tl.exp(M - m_j)
+        alpha = tl.where(M > float("-inf"), tl.exp(M - safe_m_j), 0.0)
 
         acc = acc * alpha[:, None]
         L = L * alpha + l_j
@@ -234,10 +257,19 @@ def _kernel_unified_attention_sparse_mla_2d(
             cache_modifier=KV_cache_modifier,
         )
 
+        # Preserve the deployed qh16 sparse-MLA numerical contract: the ASM
+        # kernel packs the online-softmax numerator to the FP8 KV dtype before
+        # P x V, while L remains FP32.  Promoting both operands to BF16 is a
+        # different attention operator.  On captured GLM-5.2 MXFP4 traffic it
+        # moves every layer away from the validated ASM/108 baseline and the
+        # drift is amplified by the residual stack during long generation.
         acc = tl.dot(P.to(V_lora.dtype), V_lora, acc=acc)
 
     # epilogue
-    one_over_L = 1.0 / L[:, None]
+    if kv_scale_ptr is not None:
+        one_over_L = tl.where(L[:, None] > 0.0, kv_scale / L[:, None], 0.0)
+    else:
+        one_over_L = tl.where(L[:, None] > 0.0, 1.0 / L[:, None], 0.0)
     acc = acc * one_over_L
 
     output_offs_lora = (
