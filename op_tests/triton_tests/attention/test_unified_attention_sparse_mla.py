@@ -360,3 +360,114 @@ def test_triton_unified_attn(
     torch.testing.assert_close(
         output, ref_output, atol=atol, rtol=rtol
     ), f"{torch.max(torch.abs(output - ref_output))}"
+
+
+@torch.inference_mode()
+def test_triton_unified_attn_fp8_csr_qh16() -> None:
+    """Exercise the GLM sparse-decode ABI: FP8 Q/KV and ragged CSR indices."""
+    torch.manual_seed(20260808)
+    fp8_dtype = torch.float8_e4m3fn
+    batch = 3
+    num_q_heads = 16
+    lora_dim = 512
+    rope_dim = 64
+    total_dim = lora_dim + rope_dim
+    pool_size = 96
+    row_counts = (64, 0, 64)
+    softmax_scale = 1.0 / 16.0
+
+    q_source = torch.randn(
+        batch, num_q_heads, total_dim, device="cuda", dtype=torch.float32
+    ).div_(10.0)
+    kv_source = torch.randn(
+        pool_size, total_dim, device="cuda", dtype=torch.float32
+    ).div_(10.0)
+    # GLM-5.2's deployed FP8 sparse-MLA cache uses unit descales.
+    q_descale = torch.ones(1, device="cuda", dtype=torch.float32)
+    kv_descale = torch.ones(1, device="cuda", dtype=torch.float32)
+    q = q_source.to(fp8_dtype)
+    kv_flat = kv_source.to(fp8_dtype)
+    kv = kv_flat.view(pool_size, 1, 1, total_dim)
+
+    rows = [
+        torch.randperm(pool_size, device="cuda", dtype=torch.int64)[:count].to(
+            torch.int32
+        )
+        for count in row_counts
+    ]
+    topk_indices = torch.cat(rows)
+    topk_indptr = torch.tensor(
+        [0, row_counts[0], row_counts[0], sum(row_counts)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cu_seqlens_q = torch.arange(batch + 1, device="cuda", dtype=torch.int32)
+    seqused_k = torch.tensor(row_counts, device="cuda", dtype=torch.int32)
+    block_table = torch.zeros((batch, 1), device="cuda", dtype=torch.int32)
+    output = torch.empty(
+        batch, num_q_heads, lora_dim, device="cuda", dtype=torch.bfloat16
+    )
+
+    unified_attention_sparse_mla(
+        q,
+        kv,
+        output,
+        cu_seqlens_q,
+        1,
+        seqused_k,
+        max(row_counts),
+        softmax_scale,
+        topk_indices,
+        block_table,
+        lora_dim,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        tile_size=64,
+        topk_indptr=topk_indptr,
+        topk_count=max(row_counts),
+    )
+
+    reference = torch.zeros_like(output)
+    q_raw = q.float()
+    kv_raw = kv_flat.float()
+    qk_factor = float(q_descale.item() * kv_descale.item() * softmax_scale)
+    value_scale = float(kv_descale.item())
+    for row, indices in enumerate(rows):
+        if indices.numel() == 0:
+            continue
+        selected = kv_raw.index_select(0, indices.long())
+        scores = torch.einsum("hd,kd->hk", q_raw[row], selected) * qk_factor
+        probabilities = torch.exp(scores - scores.max(dim=-1, keepdim=True).values)
+        denominator = probabilities.sum(dim=-1, keepdim=True)
+        numerator = probabilities.to(fp8_dtype).float() @ selected[:, :lora_dim]
+        reference[row] = (numerator * value_scale / denominator).to(torch.bfloat16)
+
+    torch.testing.assert_close(output, reference, atol=3e-2, rtol=2e-2)
+    assert torch.count_nonzero(output[1]).item() == 0
+
+    first = output.clone()
+    for repeat in range(10):
+        unified_attention_sparse_mla(
+            q,
+            kv,
+            output,
+            cu_seqlens_q,
+            1,
+            seqused_k,
+            max(row_counts),
+            softmax_scale,
+            topk_indices,
+            block_table,
+            lora_dim,
+            q_descale=q_descale,
+            kv_descale=kv_descale,
+            tile_size=64,
+            topk_indptr=topk_indptr,
+            topk_count=max(row_counts),
+        )
+        mismatch = output != first
+        assert not mismatch.any(), (
+            f"repeat {repeat} produced {mismatch.count_nonzero().item()} "
+            "non-bitwise-identical elements by row "
+            f"{mismatch.reshape(batch, -1).count_nonzero(dim=1).tolist()}"
+        )
