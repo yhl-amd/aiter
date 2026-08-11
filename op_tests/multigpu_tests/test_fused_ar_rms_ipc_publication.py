@@ -10,9 +10,10 @@ buffer in stage 2.
 
 Inputs alternate between two recognizable patterns. Every producer partition
 and input rank has a distinct value, so a stale or missing IPC write can be
-attributed to its producer and reuse phase. The unpatched kernel has produced
-contiguous stale or missing regions on ranks 1-7 under this stress test; the
-publication-fence fix is expected to remain bitwise equal to the BF16 reference.
+attributed to its producer and reuse phase. This is a regression stress guard,
+not a reproducer for the proposed all-writer fence: both current main and the
+fence branch pass it in the controls run so far. A failure would still provide
+useful attribution through the producer- and phase-specific sentinels.
 """
 
 from __future__ import annotations
