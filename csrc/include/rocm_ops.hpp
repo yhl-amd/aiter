@@ -1923,6 +1923,54 @@ namespace py = pybind11;
           py::arg("handle_ptrs"));                                                         \
     m.def("qr_max_size", &aiter::qr_max_size);
 
+#define EPX_PYBIND                                                                         \
+    AITER_SET_STREAM_PYBIND;                                                               \
+    m.def("epx_alloc_uncached",                                                            \
+          &aiter::epx_alloc_uncached,                                                      \
+          py::arg("bytes"));                                                               \
+    m.def("epx_free",                                                                      \
+          &aiter::epx_free,                                                                \
+          py::arg("ptr"));                                                                 \
+    m.def("epx_ipc_handle_size", &aiter::epx_ipc_handle_size);                             \
+    m.def("epx_get_ipc_handle",                                                            \
+          &aiter::epx_get_ipc_handle,                                                      \
+          py::arg("ptr"),                                                                  \
+          py::arg("out_handle_ptr"));                                                      \
+    m.def("epx_open_ipc_handle",                                                           \
+          &aiter::epx_open_ipc_handle,                                                     \
+          py::arg("handle_ptr"));                                                          \
+    m.def("epx_close_ipc_handle",                                                          \
+          &aiter::epx_close_ipc_handle,                                                    \
+          py::arg("ptr"));                                                                 \
+    m.def("epx_init",                                                                      \
+          &aiter::epx_init,                                                                \
+          py::arg("bases"),                                                                \
+          py::arg("layout"),                                                               \
+          py::arg("rank"),                                                                 \
+          py::arg("topk"),                                                                 \
+          py::arg("experts_per_rank"),                                                     \
+          py::arg("max_tokens_per_rank"),                                                  \
+          py::arg("scale_bytes"));                                                         \
+    m.def("epx_destroy",                                                                   \
+          &aiter::epx_destroy,                                                             \
+          py::arg("fa"));                                                                  \
+    m.def("epx_dispatch",                                                                  \
+          &aiter::epx_dispatch,                                                            \
+          py::arg("fa"),                                                                   \
+          py::arg("x"),                                                                    \
+          py::arg("scales"),                                                               \
+          py::arg("topk_ids"),                                                             \
+          py::arg("topk_weights"),                                                         \
+          py::arg("blocks"),                                                               \
+          py::arg("threads"));                                                             \
+    m.def("epx_combine",                                                                   \
+          &aiter::epx_combine,                                                             \
+          py::arg("fa"),                                                                   \
+          py::arg("expert_out"),                                                           \
+          py::arg("out"),                                                                  \
+          py::arg("blocks"),                                                               \
+          py::arg("threads"));
+
 #define ROPE_1C_UNCACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_fwd_impl", &rope_fwd_impl);
 #define ROPE_2C_UNCACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);
 #define ROPE_1C_CACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
