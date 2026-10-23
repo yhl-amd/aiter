@@ -63,6 +63,7 @@ def launch_gemm_a8w8(
     a_preshuffle: Constexpr[bool] = False,
     a_scale_preshuffled: Constexpr[bool] = False,
     b_scale_32x32: Constexpr[bool] = False,
+    k_tail: Constexpr[bool] = False,
 ):
     mx32 = is_mxscale and block_size == 32
     mx128 = is_mxscale and block_size == 128
@@ -75,6 +76,23 @@ def launch_gemm_a8w8(
     if b_scale_32x32 and not mx32:
         raise ValueError("b_scale_32x32 is supported only for mxfp8_32")
     preload = preload_ks > 0
+    # k_tail: K is a multiple of 32 but not of tile_k. The k-tile count rounds
+    # up and the last tile's K-advancing TDM loads clamp their inner extent to
+    # the valid K, so the hardware zero-fills the rest and those products add
+    # nothing. Only the row-major layouts are covered: a shuffled A or n32k4
+    # scale does not keep its leading K bytes contiguous.
+    if k_tail and not (
+        mx32
+        and b_scale_32x32
+        and not a_preshuffle
+        and not a_scale_preshuffled
+        and split_k == 1
+        and not preload
+    ):
+        raise ValueError(
+            "[FlyDSL gfx1250] k_tail needs mxfp8_32 with a 32x32 B scale, a "
+            "row-major A and A scale, split_k 1 and no scale preload"
+        )
     # A-preshuffle: A is shuffle_mxfp8fp4_a-tiled, [M, K] -> [M/2, K/128, 2, 128]
     A_PAIR = 2 if a_preshuffle else 1
     if a_preshuffle and batched:
@@ -200,6 +218,7 @@ def launch_gemm_a8w8(
         + ("_apre" if a_preshuffle else "")
         + ("_aspre" if a_scale_preshuffled else "")
         + ("_bs32x32" if b_scale_32x32 else "")
+        + ("_ktail" if k_tail else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -216,7 +235,11 @@ def launch_gemm_a8w8(
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
     ):
-        K_TILES = i32_k // (tile_k * split_k)
+        if const_expr(k_tail):
+            K_TILES = (i32_k + tile_k - 1) // tile_k
+            K_REM = i32_k - (K_TILES - 1) * tile_k  # valid K of the last tile
+        else:
+            K_TILES = i32_k // (tile_k * split_k)
         k64 = fx.Int64(i32_k)
         lda64 = fx.Int64(i32_lda)
         ldc64 = fx.Int64(i32_ldc)
@@ -393,19 +416,28 @@ def launch_gemm_a8w8(
             if wave == w:
                 fx.copy(atom, gt, lv, imm_offset=imm_offset)
 
+        def _tail(atom, full, rem, kt):
+            # On the last k-tile, clamp the inner extent to the valid K.
+            if const_expr(not k_tail):
+                return atom
+            is_last = fx.Int32(kt) == K_TILES - 1
+            return fx.atom_set_value(
+                atom, "extent_1", is_last.select(fx.Int32(rem), fx.Int32(full))
+            )
+
         def issue(s, kt):
             pa = _buf_ptr(s)
             ktg = fx.Int64(kt) if kt_base is None else fx.Int64(kt) + kt_base
             _wcopy(
                 W_A,
-                atomA,
+                _tail(atomA, A_TDM_ROW, K_REM if k_tail else 0, kt),
                 gA,
                 _lv(pa, (A_LDS_ROWS, A_TDM_ROW), (A_LDS_ROW, 1)),
                 ktg * A_TDM_ROW,
             )
             _wcopy(
                 W_B,
-                atomB,
+                _tail(atomB, tile_k * 16, K_REM * 16 if k_tail else 0, kt),
                 gB,
                 _lv(
                     fx.add_offset(pa, STAGE_A),
@@ -417,14 +449,14 @@ def launch_gemm_a8w8(
             if const_expr(is_mxscale and not preload):
                 _wcopy(
                     W_SA,
-                    atomSA,
+                    _tail(atomSA, tile_k // 32, K_REM // 32 if k_tail else 0, kt),
                     gSA,
                     _lv(fx.add_offset(pa, SA_OFF), SA_SHAPE, (SA_SHAPE[1], 1)),
                     sa_imm(ktg),
                 )
                 _wcopy(
                     W_SB,
-                    atomSB,
+                    _tail(atomSB, tile_k // 32, K_REM // 32 if k_tail else 0, kt),
                     gSB,
                     _lv(fx.add_offset(pa, SB_OFF), SB_SHAPE, (SB_SHAPE[1], 1)),
                     sb_imm(ktg),

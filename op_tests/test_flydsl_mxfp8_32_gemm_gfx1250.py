@@ -50,8 +50,17 @@ LINEARS = {
     "wq_b": (8192, 1280),  # heads * head_dim / 4
     "indexer.wq_b": (4096, 1280),  # index_n_heads * index_head_dim
     "wo_b": (5120, 2048),  # o_groups * o_lora_rank / 4
+    "shared.w13": (1152, 5120),  # 2 * moe_intermediate_size / 4
+    "shared.w2": (5120, 576),  # moe_intermediate_size / 4: K not a 128 multiple
 }
 LINEAR_M = (1, 7, 64, 512, 4096)
+# K a multiple of 32 but not of 128: the last k-tile is ragged (32x32 scale only).
+RAGGED_K_BMM = [
+    (1, 1, 5120, 576),
+    (33, 2, 1024, 544),
+    (300, 1, 512, 4160),
+    (4096, 1, 5120, 576),
+]
 
 
 def _fp8_and_e8m0(shape, scale_shape, gen):
@@ -123,6 +132,19 @@ def test_bmm_tails(m, g, n, k, w_scale_block):
     if w_scale_block == "1x32":
         ws = expand_32x32_to_n32k4(ws)
     _check(_bmm(x8, xs, shuffle_weight(w8), ws), ref)
+
+
+@pytest.mark.parametrize("m,g,n,k", RAGGED_K_BMM)
+def test_bmm_ragged_k(m, g, n, k):
+    x8, xs, w8, ws, ref = _wo_a_operands(m, g, n, k, seed=m + k)
+    _check(_bmm(x8, xs, shuffle_weight(w8), ws), ref)
+
+
+def test_bmm_ragged_k_refuses_n32k4_scale():
+    x8, xs, w8, ws, _ = _wo_a_operands(7, 1, 512, 576)
+    rows = ws.view(torch.uint8).repeat_interleave(32, dim=1)
+    with pytest.raises(RuntimeError, match="ragged"):
+        _bmm(x8, xs, shuffle_weight(w8), rows)
 
 
 def test_bmm_every_config_wo_a():
@@ -218,6 +240,8 @@ def test_linear(linear, m, w_scale_block):
     from aiter import gemm_a8w8_blockscale
 
     n, k = LINEARS[linear]
+    if w_scale_block == "1x32" and k % 128:
+        pytest.skip("a ragged K runs with the 32x32 scale only")
     x8, xs, w8, ws, ref = _linear_operands(m, n, k, seed=m + n + k)
     if w_scale_block == "1x32":
         ws = expand_32x32_to_n32k4(ws.view(1, n // 32, k // 32)).view(n, k // 32)

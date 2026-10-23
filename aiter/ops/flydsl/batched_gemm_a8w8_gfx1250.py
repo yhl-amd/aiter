@@ -239,10 +239,16 @@ def pick_bmm_mx32_kernel_name(
     b: int, m: int, n: int, k: int, w_scale_32x32: bool = False
 ) -> str:
     """Heuristic batched mxfp8_32 config for a shape with no tuned row."""
+    # A K that 128 does not divide (DeepSeek-V4.1's shared-expert down
+    # projection has K = 576 at TP4) runs as a ragged last k-tile, so configs
+    # are chosen for K rounded up to a whole block and must keep enough tiles.
+    k_round = -(-k // BLOCK_K) * BLOCK_K
     cands = [
         c
-        for c in bmm_candidates(b, m, n, k)
-        if c["tile_n"] % 32 == 0 and mx32_lds_bytes(c, w_scale_32x32) <= _LDS_BYTES
+        for c in bmm_candidates(b, m, n, k_round)
+        if c["tile_n"] % 32 == 0
+        and mx32_lds_bytes(c, w_scale_32x32) <= _LDS_BYTES
+        and (k == k_round or -(-k // c["tile_k"]) >= c["num_buffers"])
     ]
     if not cands:
         raise RuntimeError(
@@ -343,10 +349,16 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
     """
     m, b, n, k, out_dtype = _check_bmm_operands("mxfp8_32", XQ, WQ, Out)
     _lazy_import()
-    if n % 32 or k % BLOCK_K:
+    if n % 32 or k % MX32_BLOCK_K:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 bmm] mxfp8_32 needs N%32==0 and K%{BLOCK_K}==0, "
+            f"[FlyDSL gfx1250 bmm] mxfp8_32 needs N%32==0 and K%{MX32_BLOCK_K}==0, "
             f"got N={n}, K={k}"
+        )
+    if k % BLOCK_K and not w_scale_32x32:
+        raise RuntimeError(
+            f"[FlyDSL gfx1250 bmm] K={k} is not a multiple of {BLOCK_K}; a ragged "
+            "last k-tile needs the row-major 32x32 w_scale (an n32k4 scale does "
+            "not keep its leading K contiguous)"
         )
     k_blocks = k // MX32_BLOCK_K
     _check_e8m0(x_scale, "x_scale", "FlyDSL gfx1250 bmm", (m, b, k_blocks))
@@ -363,15 +375,17 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
             f"batched path, got {name!r}"
         )
     tile_n, tile_k = cfg["tile_n"], cfg["tile_k"]
-    if n % tile_n or k % tile_k or tile_n % 32:
+    k_tail = k % tile_k != 0
+    if n % tile_n or tile_n % 32 or (k_tail and not w_scale_32x32):
         raise RuntimeError(
-            f"[FlyDSL gfx1250 bmm] {name!r} needs N%{tile_n}==0, K%{tile_k}==0 "
-            f"and tile_n%32==0, got N={n}, K={k}"
+            f"[FlyDSL gfx1250 bmm] {name!r} needs N%{tile_n}==0, tile_n%32==0 and "
+            f"K%{tile_k}==0 (or a 32x32 w_scale for a ragged K), got N={n}, K={k}"
         )
-    if k // tile_k < cfg["num_buffers"]:
+    k_tiles = -(-k // tile_k)
+    if k_tiles < cfg["num_buffers"]:
         raise RuntimeError(
             f"[FlyDSL gfx1250 bmm] {name!r} needs >= {cfg['num_buffers']} K-tiles, "
-            f"got {k // tile_k}"
+            f"got {k_tiles}"
         )
     if m == 0:
         return Out
@@ -395,6 +409,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         False,  # a_preshuffle
         False,  # a_scale_preshuffled
         bool(w_scale_32x32),
+        k_tail,
     )
     # Cached CompiledFunction per constexpr set; see _run_compiled.
     _run_compiled(
@@ -429,6 +444,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         False,  # a_preshuffle
         False,  # a_scale_preshuffled
         bool(w_scale_32x32),
+        k_tail,
         specialization_key=bmm_spec,
     )
     return Out
