@@ -341,10 +341,42 @@ def test_mxscale_bpreshuffle_rejects_unknown_implementation(monkeypatch):
 
 
 def test_mxscale_bpreshuffle_rejects_row_scales(monkeypatch):
+    from aiter.ops.flydsl import batched_gemm_a8w8 as bmm
+
+    # gfx950's bmm has no 1x32 kernel (gfx1250's reads the n32k4 one).
     monkeypatch.setattr(gemm_op_a8w8, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(bmm, "get_gfx", lambda: "gfx950")
     monkeypatch.setattr(gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a: None)
     with pytest.raises(NotImplementedError, match="1x32"):
         gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(*_mxscale_operands(w_rows=1))
+
+
+@pytest.mark.parametrize("w_rows", [32, 1])
+def test_gfx1250_group32_bpreshuffle_route(monkeypatch, w_rows):
+    """gfx1250 group32: a 32x32 w_scale goes to the batched mxfp8_32 GEMM at
+    B = 1 (read raw), a 1x32 (n32k4) one to gemm_a8w8_mxfp8_bpreshuffle."""
+    from aiter.ops.flydsl import batched_gemm_a8w8 as bmm
+
+    calls = []
+
+    def run_bmm(x, w, xs, ws, out, kernel_name=None, x_scale_transposed=False):
+        calls.append(("bmm", ws.shape, x_scale_transposed))
+        return out
+
+    def run_mxfp8(x, w, xs, ws, dtype=None, out=None):
+        calls.append(("mxfp8", ws.shape, out.shape))
+        return out
+
+    monkeypatch.setattr(gemm_op_a8w8, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a: None)
+    monkeypatch.setattr(bmm, "run_bmm_a8w8_mxfp8", run_bmm)
+    monkeypatch.setattr(gemm_op_a8w8, "gemm_a8w8_mxfp8_bpreshuffle", run_mxfp8)
+    y = gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(*_mxscale_operands(w_rows=w_rows))
+    assert y.shape == (3, 256)
+    if w_rows == 32:
+        assert calls == [("bmm", (1, 8, 16), False)]
+    else:
+        assert calls == [("mxfp8", (256, 16), (3, 256))]
 
 
 def test_blockscale_preshuffled_group32_forwards_e8m0_views(monkeypatch):

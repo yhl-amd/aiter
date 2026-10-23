@@ -14,8 +14,7 @@ This test pins the a8w4 path the model will run:
   2. ``preshuffle_a8w4_weight_mbn`` — offline MXFP4 weight + n32k4 scale,
   3. ``flydsl_batched_gemm_a8w4_v2`` (layout='mbn', preallocated ``out=``),
 and the a8w8 path ``batched_gemm_a8w8_mxscale_bpreshuffle`` with each e8m0
-block the arch runs: 1x32 / 32x32 and 1x128 / 128x128 on gfx950, 1x128 /
-128x128 on gfx1250.
+block the arch runs: 1x32 / 32x32 and 1x128 / 128x128 on gfx950 and gfx1250.
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
@@ -57,7 +56,7 @@ SUPPORTED_GFX = ["gfx950", "gfx1250"]
 A8W4_GFX = ["gfx1250"]  # flydsl_batched_gemm_a8w4_v2
 SEED = 0
 # a8w8 e8m0 blocks per arch: 1xBLOCK on the activation, BLOCKxBLOCK on the weight.
-A8W8_BLOCKS = {"gfx950": (32, 128), "gfx1250": (128,)}
+A8W8_BLOCKS = {"gfx950": (32, 128), "gfx1250": (32, 128)}
 
 
 def _to_e8m0_scale(scale):
