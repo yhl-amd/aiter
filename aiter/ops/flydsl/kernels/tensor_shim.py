@@ -280,6 +280,10 @@ def ptr_arg(t: torch.Tensor, dtype=None):
     """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
     if dtype is None:
         dtype = fx.Uint8
+    if type(t) is torch.Tensor:
+        # Plain tensor (the launch hot path): cannot be a FakeTensor, which is
+        # a torch.Tensor subclass and takes the checks below.
+        return flyc.from_c_void_p(dtype, t.data_ptr())
     type_name = type(t).__name__
     module_name = type(t).__module__
     if type_name == "FakeTensor" or "fake_tensor" in module_name:
