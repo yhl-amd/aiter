@@ -12,6 +12,7 @@ import os
 import threading
 
 import torch
+from aiter.ops.flydsl._stream import current_stream as _current_stream
 
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
@@ -494,7 +495,7 @@ def _build_g2l_lut(
                 int(n),
                 int(E),
                 int(topk) if _want_nvr else 0,
-                stream=torch.cuda.current_stream(),
+                stream=_current_stream(),
             )
             return lut, counter, (nvr if _want_nvr else None)
         except Exception as exc:  # noqa: BLE001  # pragma: no cover
@@ -1417,15 +1418,23 @@ def grouped_gemm_gfx1250_a8w4(
     can fall back to the generic MoE.
     """
 
-    def _grouped_dbg(msg: str, stacklevel: int = 1):
-        if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
-            "",
-            "0",
-            "false",
-            "False",
-        ):
+    # Read once per call (still honours a runtime change of the variable): when
+    # it is off -- always, in serving -- no debug message is formatted at all.
+    _dbg_on = os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
+        "",
+        "0",
+        "false",
+        "False",
+    )
+
+    def _grouped_dbg(msg, stacklevel: int = 1):
+        # ``msg`` may be a zero-arg callable so call sites only build their
+        # f-string when debugging is on.
+        if _dbg_on:
             import inspect
 
+            if callable(msg):
+                msg = msg()
             frame = inspect.stack()[stacklevel]
             print(
                 f"[grouped-gemm-debug] {frame.filename}:{frame.lineno} {msg}",
@@ -1438,7 +1447,7 @@ def grouped_gemm_gfx1250_a8w4(
         return repr(v)
 
     _grouped_dbg(
-        "inputs: "
+        lambda: "inputs: "
         + ", ".join(
             f"{k}={_fmt(v)}"
             for k, v in [
@@ -1477,7 +1486,7 @@ def grouped_gemm_gfx1250_a8w4(
         return None
     _is_ep = expert_mask is not None
     if _is_ep:
-        _grouped_dbg(f"EP enabled: expert_mask numel={expert_mask.numel()}, E={E}")
+        _grouped_dbg(lambda: f"EP enabled: expert_mask numel={expert_mask.numel()}, E={E}")
     if hidden_pad != 0 or intermediate_pad != 0:
         hidden_pad = 0
         intermediate_pad = 0
@@ -1504,16 +1513,19 @@ def grouped_gemm_gfx1250_a8w4(
         return None
     data_format = "fp4" if is_grouped_a4w4 else "a8w4"
     q_dtype_w_key = dtypes.fp4x2 if w_is_mxfp4 else q_dtype_w
-    _grouped_dbg(f"eligible data_format={data_format}")
+    _grouped_dbg(lambda: f"eligible data_format={data_format}")
     if w1_scale is None or w2_scale is None:
         return None
-    _gfx_env = ";".join(
-        str(os.environ.get(k, "")).lower()
-        for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
-    )
-    _force_gfx1250 = os.environ.get("AITER_FORCE_GFX1250", "0") in _TRUTHY_ENV
-    if get_gfx() != "gfx1250" and "gfx1250" not in _gfx_env and not _force_gfx1250:
-        return None
+    # The env overrides only matter off gfx1250 (same condition, evaluated
+    # lazily so the native-arch path skips the four env reads).
+    if get_gfx() != "gfx1250":
+        _gfx_env = ";".join(
+            str(os.environ.get(k, "")).lower()
+            for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
+        )
+        _force_gfx1250 = os.environ.get("AITER_FORCE_GFX1250", "0") in _TRUTHY_ENV
+        if "gfx1250" not in _gfx_env and not _force_gfx1250:
+            return None
 
     device = hidden_states.device
     token_num, topk = topk_ids.shape
@@ -1556,7 +1568,7 @@ def grouped_gemm_gfx1250_a8w4(
         tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
         n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
         num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
-        _grouped_dbg(f"using grouped CSV config: {cfg_row}")
+        _grouped_dbg(lambda: f"using grouped CSV config: {cfg_row}")
     else:
         logger.info(
             "no grouped CSV config matched (token=%d model_dim=%d inter_dim=%d "
@@ -1840,7 +1852,7 @@ def fused_route_psum_remap(
         experts,
         int(max_m),
         int(tile_m),
-        stream=torch.cuda.current_stream(),
+        stream=_current_stream(),
     )
     return masked_m, topids_to_rows.view(token_num, topk), psum
 
@@ -1861,7 +1873,7 @@ def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
         ptr_arg(contiguous_m_t),
         experts,
         int(tile_m),
-        stream=torch.cuda.current_stream(),
+        stream=_current_stream(),
     )
     return starts, psum, contiguous_m_t
 
@@ -1930,7 +1942,7 @@ def contiguous_psum_remap(
             int(ep_scatter_params["topk"]),
             int(ep_scatter_params["max_tok"]),
             int(ep_scatter_params["slot_stride"]),
-            stream=torch.cuda.current_stream(),
+            stream=_current_stream(),
         )
         return starts, psum, contiguous_m_t
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import MAX_REMAP_EXPERTS
@@ -1951,7 +1963,7 @@ def contiguous_psum_remap(
         int(route_max_m),
         int(tile_m),
         ptr_arg(num_valid_routes_i32),
-        stream=torch.cuda.current_stream(),
+        stream=_current_stream(),
     )
     return starts, psum, contiguous_m_t
 
@@ -1976,7 +1988,7 @@ def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
         topk,
         max_m,
         grid_blocks,
-        stream=torch.cuda.current_stream(),
+        stream=_current_stream(),
     )
     masked_m = atomic_buffer
     return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
@@ -2053,7 +2065,7 @@ def flydsl_moe_gather_reduce(
         token_num,
         slice_stride_dw,
         ptr_arg(num_valid_tokens_i32),
-        stream=torch.cuda.current_stream(),
+        stream=_current_stream(),
     )
     return out
 
@@ -2097,7 +2109,7 @@ def flydsl_moe_scatter_copy_token(
         grouped_a1.view(num_dst, payload_w),
         rows_to_tokens,
         num_dst,
-        stream=torch.cuda.current_stream(),
+        stream=_current_stream(),
     )
 
     if a1_scale_token_u8 is not None:
@@ -2112,7 +2124,7 @@ def flydsl_moe_scatter_copy_token(
             a1_scale_raw.view(num_dst, scale_w),
             rows_to_tokens,
             num_dst,
-            stream=torch.cuda.current_stream(),
+            stream=_current_stream(),
         )
 
     return grouped_a1, a1_scale_raw
@@ -2171,7 +2183,7 @@ def flydsl_moe_scatter_preshuffle_scale(
         max_m,
         E,
         tiles_per_expert,
-        stream=torch.cuda.current_stream(),
+        stream=_current_stream(),
     )
     return grouped_a1_scale
 
@@ -2208,6 +2220,6 @@ def flydsl_moe_preshuffle_scale(
         max_m,
         E,
         tiles_per_expert,
-        stream=torch.cuda.current_stream(),
+        stream=_current_stream(),
     )
     return out

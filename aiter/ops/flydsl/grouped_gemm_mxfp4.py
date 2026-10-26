@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 
 import torch
+from ._stream import current_stream as _current_stream
 
 from .kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from .kernels.tensor_shim import ptr_arg
@@ -150,7 +151,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
     if stream is None:
-        stream = torch.cuda.current_stream()
+        stream = _current_stream()
     if stage1_act == 3:
         if float(situ_beta) <= 0.0:
             raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
