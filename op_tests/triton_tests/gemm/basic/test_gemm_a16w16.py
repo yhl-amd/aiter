@@ -73,7 +73,9 @@ def get_x_vals():
 
 # DSv4.1 router GEMM: TN layout only, so it is not in get_x_vals().
 # The M values are the lowest and highest M of each tuned gfx1250 bucket.
-_DSV41_ROUTER_X_VALS = [(M, 384, 5120) for M in (545, 576, 641, 672, 737, 768)]
+_DSV41_ROUTER_X_VALS = [
+    (M, 384, 5120) for M in (545, 576, 641, 672, 737, 768, 1025, 1344, 1345, 1536)
+]
 
 
 # Test plain BF16 GEMMs - the most common types.
