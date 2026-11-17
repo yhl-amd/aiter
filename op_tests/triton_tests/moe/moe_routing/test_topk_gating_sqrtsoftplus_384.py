@@ -13,6 +13,7 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops import topk as topk_ops
+from aiter.ops.triton.moe.moe_routing import topk_gating as topk_gating_launchers
 from aiter.ops.triton.moe.moe_routing.topk_gating import (
     SQRTSOFTPLUS_384_ARCHS,
     SQRTSOFTPLUS_384_EXPERTS,
@@ -147,10 +148,31 @@ def test_topk_gating_dispatch(monkeypatch, capturing):
         weights = torch.empty((rows, 6), dtype=torch.float32, device="cuda")
         ids = torch.empty((rows, 6), dtype=torch.int32, device="cuda")
         can_use = topk_ops._can_use_sqrtsoftplus_384_topk
-        assert can_use(weights, ids, logits, bias, True, "sqrtsoftplus") is expected
-        assert not can_use(weights, ids, logits, bias, False, "sqrtsoftplus")
-        assert not can_use(weights, ids, logits, bias, True, "sigmoid")
-        assert not can_use(weights, ids, logits, bias.bfloat16(), True, "sqrtsoftplus")
+        assert can_use(weights, ids, logits, bias) is expected
+        assert not can_use(weights, ids, logits, bias.bfloat16())
+
+
+@pytest.mark.parametrize(
+    "need_renorm, score_func", [(False, "sqrtsoftplus"), (True, "sigmoid")]
+)
+def test_topk_gating_keeps_hip_for_another_call(monkeypatch, need_renorm, score_func):
+    """The checks at the call site send these calls to HIP even under capture."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        topk_gating_launchers, "sqrtsoftplus_384_topk", _no_triton, raising=True
+    )
+    rows, topk = 8, 6
+    logits = _logits(rows, 5, "random")
+    bias = _bias("linear")
+    weights = torch.empty((rows, topk), dtype=torch.float32, device="cuda")
+    ids = torch.empty((rows, topk), dtype=torch.int32, device="cuda")
+    topk_ops.topk_gating(
+        weights, ids, logits, bias, need_renorm, SCALE, score_func=score_func
+    )
+
+
+def _no_triton(*args, **kwargs):
+    pytest.fail("topk_gating ran the Triton kernel")
 
 
 def _no_hip(*args, **kwargs):

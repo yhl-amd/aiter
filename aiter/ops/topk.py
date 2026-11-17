@@ -37,6 +37,19 @@ _GFX1250_SIGMOID_EXPERTS = {512, 768, 896, 900, 1024}
 _GFX1250_SIGMOID_TOPKS = {4, 5, 8, 9, 16, 17}
 
 
+def _topk_outputs_ok(
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor, rows: int, topk: int
+) -> bool:
+    """FP32 weights and INT32 ids of [rows, topk] with unit column stride."""
+    return (
+        topk_weights.shape == topk_ids.shape == (rows, topk)
+        and (topk_weights.dtype, topk_ids.dtype) == (torch.float32, torch.int32)
+        and topk_weights.stride(1) == topk_ids.stride(1) == 1
+        and topk_weights.stride(0) >= topk
+        and topk_ids.stride(0) >= topk
+    )
+
+
 def _can_use_gfx1250_exact_sigmoid_topk(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -68,13 +81,7 @@ def _can_use_gfx1250_exact_sigmoid_topk(
         and correction_bias.dtype in (torch.bfloat16, torch.float32)
         and correction_bias.stride(0) == 1
     )
-    outputs_ok = (
-        topk_weights.shape == topk_ids.shape == (rows, topk)
-        and (topk_weights.dtype, topk_ids.dtype) == (torch.float32, torch.int32)
-        and topk_weights.stride(1) == topk_ids.stride(1) == 1
-        and topk_weights.stride(0) >= topk
-        and topk_ids.stride(0) >= topk
-    )
+    outputs_ok = _topk_outputs_ok(topk_weights, topk_ids, rows, topk)
     same_device = (
         correction_bias.device
         == topk_weights.device
@@ -108,13 +115,18 @@ def _gfx1250_exact_sigmoid_topk(
     )
 
 
-@functools.cache
-def _sqrtsoftplus_384_arch(gfx: str):
-    """The SQRTSOFTPLUS_384_ARCHS entry of gfx, or None. Cached, so a call of
-    topk_gating neither imports the Triton module nor looks the table up."""
+def _runtime_sqrtsoftplus_384_arch():
+    """The SQRTSOFTPLUS_384_ARCHS entry of the runtime arch, or None."""
     from .triton.moe.moe_routing.topk_gating import SQRTSOFTPLUS_384_ARCHS
 
-    return SQRTSOFTPLUS_384_ARCHS.get(gfx)
+    return SQRTSOFTPLUS_384_ARCHS.get(get_gfx_runtime())
+
+
+_UNSET = object()
+# _runtime_sqrtsoftplus_384_arch(), set at the first renormalized 384-expert
+# sqrtsoftplus call: importing aiter needs no GPU, and later calls neither
+# import the Triton module nor query the arch.
+_sqrtsoftplus_384_arch = _UNSET
 
 
 def _can_use_sqrtsoftplus_384_topk(
@@ -122,24 +134,27 @@ def _can_use_sqrtsoftplus_384_topk(
     topk_indices: torch.Tensor,
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
-    need_renorm: bool,
-    score_func: str,
 ) -> bool:
-    """Whether the Triton 384-expert sqrtsoftplus top-k gives this call's result."""
-    if score_func != "sqrtsoftplus" or not need_renorm or gating_output.ndim != 2:
+    """Whether the Triton 384-expert sqrtsoftplus top-k gives this call's result.
+
+    The caller has checked score_func == "sqrtsoftplus", need_renorm, no shared
+    columns and gating_output.shape[-1] == 384.
+    """
+    global _sqrtsoftplus_384_arch
+    arch = _sqrtsoftplus_384_arch
+    if arch is _UNSET:
+        arch = _sqrtsoftplus_384_arch = _runtime_sqrtsoftplus_384_arch()
+    if arch is None or gating_output.ndim != 2:
         return False
-    rows, experts = gating_output.shape
-    if experts != 384:
+    rows = gating_output.shape[0]
+    if not 1 <= rows <= arch.max_rows:
         return False
-    arch = _sqrtsoftplus_384_arch(get_gfx_runtime())
-    if arch is None or not 1 <= rows <= arch.max_rows:
-        return False
-    # Eager calls end here on a graph_only arch: the checks below are for capture.
+    # The capture query is the last of the cheap checks. Eager calls on a
+    # graph_only arch end here, so they do not pay for the tensor checks below.
     if arch.graph_only and not torch.cuda.is_current_stream_capturing():
         return False
     if topk_indices.ndim != 2 or not 1 <= topk_indices.shape[1] <= 8:
         return False
-    topk = topk_indices.shape[1]
     return (
         gating_output.dtype == torch.bfloat16
         and gating_output.stride(1) == 1
@@ -151,9 +166,7 @@ def _can_use_sqrtsoftplus_384_topk(
                 and correction_bias.stride(0) == 1
             )
         )
-        and topk_weights.shape == topk_indices.shape == (rows, topk)
-        and (topk_weights.dtype, topk_indices.dtype) == (torch.float32, torch.int32)
-        and topk_weights.stride(1) == topk_indices.stride(1) == 1
+        and _topk_outputs_ok(topk_weights, topk_indices, rows, topk_indices.shape[1])
     )
 
 
@@ -291,13 +304,14 @@ def topk_gating(
             num_valid_rows,
         )
         return
-    if num_shared_experts == 0 and _can_use_sqrtsoftplus_384_topk(
-        topk_weights,
-        topk_indices,
-        gating_output,
-        correction_bias,
-        need_renorm,
-        score_func,
+    if (
+        score_func == "sqrtsoftplus"
+        and need_renorm
+        and num_shared_experts == 0
+        and gating_output.shape[-1] == 384
+        and _can_use_sqrtsoftplus_384_topk(
+            topk_weights, topk_indices, gating_output, correction_bias
+        )
     ):
         from .triton.moe.moe_routing.topk_gating import sqrtsoftplus_384_topk
 

@@ -33,11 +33,12 @@ def _args(rows, topk=6, experts=EXPERTS, dtype=torch.bfloat16, bias="fp32"):
 
 def _patch(monkeypatch, gfx, capturing):
     monkeypatch.setattr(topk_ops, "get_gfx_runtime", lambda: gfx)
+    monkeypatch.setattr(topk_ops, "_sqrtsoftplus_384_arch", topk_ops._UNSET)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
 
 
-def _can_use(args, need_renorm=True, score_func="sqrtsoftplus"):
-    return topk_ops._can_use_sqrtsoftplus_384_topk(*args, need_renorm, score_func)
+def _can_use(args):
+    return topk_ops._can_use_sqrtsoftplus_384_topk(*args)
 
 
 @pytest.mark.parametrize("gfx", sorted(SQRTSOFTPLUS_384_ARCHS))
@@ -62,9 +63,6 @@ def test_each_contract_term(monkeypatch, gfx):
     assert _can_use(_args(8, bias="none"))
     assert _can_use(_args(8, topk=1))
     assert _can_use(_args(8, topk=8))
-    assert not _can_use(_args(8), need_renorm=False)
-    assert not _can_use(_args(8), score_func="sigmoid")
-    assert not _can_use(_args(8, experts=256))
     assert not _can_use(_args(8, dtype=torch.float16))
     assert not _can_use(_args(8, bias="bf16"))
     assert not _can_use(_args(8, topk=9))
@@ -76,9 +74,18 @@ def test_each_contract_term(monkeypatch, gfx):
     assert not _can_use((weights, ids.long(), logits, bias))
 
 
-def test_arch_follows_the_runtime_arch(monkeypatch):
-    """The cached table lookup is per arch, so another arch gets its own entry."""
-    known = min(SQRTSOFTPLUS_384_ARCHS)
-    for gfx, expected in ((known, True), ("gfx942", False), (known, True)):
-        _patch(monkeypatch, gfx, True)
-        assert _can_use(_args(1)) is expected, gfx
+def test_an_arch_outside_the_table(monkeypatch):
+    _patch(monkeypatch, "gfx942", True)
+    assert not _can_use(_args(1))
+
+
+def test_the_arch_is_looked_up_once(monkeypatch):
+    """The entry is read from a module-level value after the first call."""
+    calls = []
+    gfx = min(SQRTSOFTPLUS_384_ARCHS)
+    _patch(monkeypatch, gfx, True)
+    monkeypatch.setattr(topk_ops, "get_gfx_runtime", lambda: calls.append(1) or gfx)
+    for _ in range(3):
+        assert _can_use(_args(1))
+    assert len(calls) == 1
+    assert topk_ops._sqrtsoftplus_384_arch == SQRTSOFTPLUS_384_ARCHS[gfx]
