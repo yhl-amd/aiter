@@ -108,6 +108,15 @@ def _gfx1250_exact_sigmoid_topk(
     )
 
 
+@functools.cache
+def _sqrtsoftplus_384_arch(gfx: str):
+    """The SQRTSOFTPLUS_384_ARCHS entry of gfx, or None. Cached, so a call of
+    topk_gating neither imports the Triton module nor looks the table up."""
+    from .triton.moe.moe_routing.topk_gating import SQRTSOFTPLUS_384_ARCHS
+
+    return SQRTSOFTPLUS_384_ARCHS.get(gfx)
+
+
 def _can_use_sqrtsoftplus_384_topk(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -117,21 +126,15 @@ def _can_use_sqrtsoftplus_384_topk(
     score_func: str,
 ) -> bool:
     """Whether the Triton 384-expert sqrtsoftplus top-k gives this call's result."""
-    if (
-        score_func != "sqrtsoftplus"
-        or not need_renorm
-        or gating_output.ndim != 2
-        or gating_output.shape[1] != 384
-    ):
+    if score_func != "sqrtsoftplus" or not need_renorm or gating_output.ndim != 2:
         return False
-    from .triton.moe.moe_routing.topk_gating import SQRTSOFTPLUS_384_ARCHS
-
-    arch = SQRTSOFTPLUS_384_ARCHS.get(get_gfx_runtime())
-    if arch is None:
+    rows, experts = gating_output.shape
+    if experts != 384:
         return False
-    rows = gating_output.shape[0]
-    if not 1 <= rows <= arch.max_rows:
+    arch = _sqrtsoftplus_384_arch(get_gfx_runtime())
+    if arch is None or not 1 <= rows <= arch.max_rows:
         return False
+    # Eager calls end here on a graph_only arch: the checks below are for capture.
     if arch.graph_only and not torch.cuda.is_current_stream_capturing():
         return False
     if topk_indices.ndim != 2 or not 1 <= topk_indices.shape[1] <= 8:
