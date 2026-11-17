@@ -32,15 +32,13 @@ class SqrtSoftplus384Arch(NamedTuple):
 # Keyed by get_gfx_runtime(). The HIP kernel and its layout:
 # gfx950: topk_gating_kernel_opt, for all row counts; it is the faster one
 # above 2048 rows.
-# gfx1250-strict: topk_gating_kernel_opt_multiwave<.., 384, 4, ..>, up to 1024
-# rows.
-# Not gfx1250: its HIP single-wave kernel for 384 experts
-# (topk_gating_kernel_opt_vwave, gated to gfx1250 only) is at least as fast as the Triton kernel.
+# No other arch is in the table. On gfx1250 the HIP single-wave kernel for 384
+# experts (topk_gating_kernel_opt_vwave) is at least as fast as the Triton
+# kernel; gfx1250-strict and gfx942 have not been measured.
 # Eager calls stay on HIP: there the Triton launch costs more host time than
 # the kernel saves.
 SQRTSOFTPLUS_384_ARCHS = {
     "gfx950": SqrtSoftplus384Arch(1, 64, 6, 2048, True),
-    "gfx1250-strict": SqrtSoftplus384Arch(4, 32, 3, 1024, True),
 }
 
 
@@ -97,7 +95,7 @@ def sqrtsoftplus_384_topk(
     [rows, 384] with unit column stride, an FP32 bias of [384] or None, FP32
     topk_weights and INT32 topk_ids of [rows, topk] with topk from 1 to 8.
     The result follows the HIP kernel bit for bit up to the max_rows of the
-    arch; on gfx1250-strict the HIP kernel uses another layout above that.
+    arch.
     """
     if num_valid_rows is not None and (
         num_valid_rows.dtype != torch.int32 or num_valid_rows.numel() < 1
