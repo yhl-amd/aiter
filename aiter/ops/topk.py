@@ -123,8 +123,8 @@ def _runtime_sqrtsoftplus_384_arch():
 
 
 _UNSET = object()
-# _runtime_sqrtsoftplus_384_arch(), set at the first renormalized 384-expert
-# sqrtsoftplus call: importing aiter needs no GPU, and later calls neither
+# _runtime_sqrtsoftplus_384_arch(), set at the first call that asks for the
+# Triton 384-expert top-k: importing aiter needs no GPU, and later calls neither
 # import the Triton module nor query the arch.
 _sqrtsoftplus_384_arch = _UNSET
 
@@ -137,8 +137,8 @@ def _can_use_sqrtsoftplus_384_topk(
 ) -> bool:
     """Whether the Triton 384-expert sqrtsoftplus top-k gives this call's result.
 
-    The caller has checked score_func == "sqrtsoftplus", need_renorm, no shared
-    columns and gating_output.shape[-1] == 384.
+    The caller has checked prefer_triton_384, score_func == "sqrtsoftplus",
+    need_renorm, no shared columns and gating_output.shape[-1] == 384.
     """
     global _sqrtsoftplus_384_arch
     arch = _sqrtsoftplus_384_arch
@@ -148,10 +148,6 @@ def _can_use_sqrtsoftplus_384_topk(
         return False
     rows = gating_output.shape[0]
     if not 1 <= rows <= arch.max_rows:
-        return False
-    # The capture query is the last of the cheap checks. Eager calls on a
-    # graph_only arch end here, so they do not pay for the tensor checks below.
-    if arch.graph_only and not torch.cuda.is_current_stream_capturing():
         return False
     if topk_indices.ndim != 2 or not 1 <= topk_indices.shape[1] <= 8:
         return False
@@ -233,7 +229,9 @@ def _topk_gating_fake(*args, **kwargs) -> None:
     return
 
 
-@_route(op="topk_gating", version=1, fake=_topk_gating_fake)
+# Version 2 adds prefer_triton_384. A v1 provider takes one argument fewer, so
+# v1 is not superseded: the arity check rejects it.
+@_route(op="topk_gating", version=2, fake=_topk_gating_fake)
 def topk_gating(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -244,6 +242,7 @@ def topk_gating(
     score_func: str = "sqrtsoftplus",
     num_shared_experts: int = 0,
     num_valid_rows: torch.Tensor | None = None,
+    prefer_triton_384: bool = False,
 ) -> None:
     """Unified fused topk gating for MoE routing.
 
@@ -265,6 +264,12 @@ def topk_gating(
             routed ids are written -1 (which expert-parallel dispatch skips)
             and their weights 0; shared columns are written as for any row.
             Read on device, so a replayed CUDA graph follows each step's count.
+        prefer_triton_384: run a renormalized 384-expert sqrtsoftplus call
+            without shared columns on the Triton kernel when the arch has an
+            entry in SQRTSOFTPLUS_384_ARCHS and the call fits its limits. The
+            result is bit-identical to HIP. Pass True only where the host cost
+            of a Triton launch does not count, such as in a CUDA graph capture.
+            Other calls run HIP.
     """
     assert (
         score_func in _VALID_SCORE_FUNCS
@@ -305,7 +310,8 @@ def topk_gating(
         )
         return
     if (
-        score_func == "sqrtsoftplus"
+        prefer_triton_384
+        and score_func == "sqrtsoftplus"
         and need_renorm
         and num_shared_experts == 0
         and gating_output.shape[-1] == 384
@@ -313,9 +319,12 @@ def topk_gating(
             topk_weights, topk_indices, gating_output, correction_bias
         )
     ):
-        from .triton.moe.moe_routing.topk_gating import sqrtsoftplus_384_topk
+        from .triton.moe.moe_routing.topk_gating import (
+            _sqrtsoftplus_384_topk_launch,
+        )
 
-        sqrtsoftplus_384_topk(
+        _sqrtsoftplus_384_topk_launch(
+            _sqrtsoftplus_384_arch,
             gating_output,
             correction_bias if correction_bias.numel() else None,
             topk_weights,

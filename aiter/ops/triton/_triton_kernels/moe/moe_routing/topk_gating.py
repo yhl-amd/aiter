@@ -171,6 +171,8 @@ def _sqrtsoftplus_384_topk(
     are the same as there.
     """
     tl.static_assert(EPT == 3 or EPT == 6, "EPT must be 3 or 6")
+    # idx & (LANES - 1) finds the lane that holds expert idx.
+    tl.static_assert((LANES & (LANES - 1)) == 0, "LANES must be a power of two")
     tl.static_assert(WAVES * LANES * EPT == 384, "the lanes must hold 384 experts")
     C: tl.constexpr = WAVES * LANES
     row = tl.program_id(0)

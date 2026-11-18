@@ -8,7 +8,6 @@ from typing import NamedTuple
 import torch
 import triton
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton._triton_kernels.moe.moe_routing.topk_gating import (
     _exact_sigmoid_biased_topk,
     _sqrtsoftplus_384_topk,
@@ -24,9 +23,9 @@ class SqrtSoftplus384Arch(NamedTuple):
     waves: int  # waves for each row
     lanes: int  # lanes for each wave
     ept: int  # experts for each lane
-    # The rows that topk_gating sends to the Triton kernel.
-    max_rows: int  # most rows; the HIP kernel takes larger calls
-    graph_only: bool  # only under CUDA graph capture; eager calls run HIP
+    # The most rows that topk_gating sends to the Triton kernel; the HIP kernel
+    # takes larger calls.
+    max_rows: int
 
 
 # Keyed by get_gfx_runtime(). The HIP kernel and its layout:
@@ -35,10 +34,11 @@ class SqrtSoftplus384Arch(NamedTuple):
 # No other arch is in the table. On gfx1250 the HIP single-wave kernel for 384
 # experts (topk_gating_kernel_opt_vwave) is at least as fast as the Triton
 # kernel; gfx1250-strict and gfx942 have not been measured.
-# Eager calls stay on HIP: there the Triton launch costs more host time than
-# the kernel saves.
+# topk_gating runs the Triton kernel only for callers that pass
+# prefer_triton_384=True, such as a CUDA graph capture: an eager Triton launch
+# costs more host time than the kernel saves. Every other call runs HIP.
 SQRTSOFTPLUS_384_ARCHS = {
-    "gfx950": SqrtSoftplus384Arch(1, 64, 6, 2048, True),
+    "gfx950": SqrtSoftplus384Arch(1, 64, 6, 2048),
 }
 
 
@@ -76,7 +76,8 @@ def exact_sigmoid_biased_topk(
     )
 
 
-def sqrtsoftplus_384_topk(
+def _sqrtsoftplus_384_topk_launch(
+    arch: SqrtSoftplus384Arch,
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor | None,
     topk_weights: torch.Tensor,
@@ -91,24 +92,18 @@ def sqrtsoftplus_384_topk(
     renormalized and multiplied by routed_scaling_factor. Rows at or past
     num_valid_rows get ids -1 and weights 0.
 
-    Limits: an arch in SQRTSOFTPLUS_384_ARCHS, BF16 gating_output of
-    [rows, 384] with unit column stride, an FP32 bias of [384] or None, FP32
-    topk_weights and INT32 topk_ids of [rows, topk] with topk from 1 to 8.
-    The result follows the HIP kernel bit for bit up to the max_rows of the
-    arch.
+    Private: topk_gating(..., prefer_triton_384=True) is the entry point. It
+    checks the limits below and sends any other call to HIP. Limits: arch is
+    the SQRTSOFTPLUS_384_ARCHS entry of the device, BF16 gating_output of
+    [rows, 384] with unit column stride and 1 to arch.max_rows rows, an FP32
+    bias of [384] or None, FP32 topk_weights and INT32 topk_ids of
+    [rows, topk] with unit column stride and topk from 1 to 8.
     """
     if num_valid_rows is not None and (
         num_valid_rows.dtype != torch.int32 or num_valid_rows.numel() < 1
     ):
         raise ValueError(
             "num_valid_rows must be an int32 tensor of at least one element"
-        )
-    gfx = get_gfx_runtime()
-    arch = SQRTSOFTPLUS_384_ARCHS.get(gfx)
-    if arch is None:
-        raise ValueError(
-            f"sqrtsoftplus_384_topk supports {sorted(SQRTSOFTPLUS_384_ARCHS)}, "
-            f"not {gfx}"
         )
     topk = topk_ids.shape[1]
     _sqrtsoftplus_384_topk[(gating_output.shape[0],)](

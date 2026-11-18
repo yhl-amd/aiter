@@ -154,10 +154,10 @@
   "version": 1
  },
  "topk_gating": {
-  "fingerprint": "b6325c278faa3184",
-  "signature": "topk_weights:positional:torch.Tensor, topk_indices:positional:torch.Tensor, gating_output:positional:torch.Tensor, correction_bias:positional:torch.Tensor | None=None, need_renorm:positional:bool=True, routed_scaling_factor:positional:float=1.0, score_func:positional:str='sqrtsoftplus', num_shared_experts:positional:int=0, num_valid_rows:positional:torch.Tensor | None=None, -> None",
+  "fingerprint": "ec7901e1346b86ff",
+  "signature": "topk_weights:positional:torch.Tensor, topk_indices:positional:torch.Tensor, gating_output:positional:torch.Tensor, correction_bias:positional:torch.Tensor | None=None, need_renorm:positional:bool=True, routed_scaling_factor:positional:float=1.0, score_func:positional:str='sqrtsoftplus', num_shared_experts:positional:int=0, num_valid_rows:positional:torch.Tensor | None=None, prefer_triton_384:positional:bool=False, -> None",
   "source": "aiter/ops/topk.py",
   "supersedes": [],
-  "version": 1
+  "version": 2
  }
 }

@@ -522,10 +522,10 @@ def bench_topk_softplus(
 @benchmark()
 def bench_sqrtsoftplus_384(num_tokens, topk, route_scale=1.5):
     """Compare the Triton 384-expert sqrtsoftplus top-k with the HIP kernel.
-    The bit check runs eagerly: the Triton result must be bit-identical. The
-    CUDA graph is used only to time the two kernels."""
-    from aiter.ops.topk import topk_gating_fwd
-    from aiter.ops.triton.moe.moe_routing.topk_gating import sqrtsoftplus_384_topk
+    topk_gating takes the Triton kernel with prefer_triton_384=True. The bit
+    check runs eagerly: the Triton result must be bit-identical. The CUDA graph
+    is used only to time the two kernels."""
+    from aiter.ops.topk import topk_gating, topk_gating_fwd
 
     torch.random.manual_seed(0)
     num_experts = 384
@@ -537,8 +537,15 @@ def bench_sqrtsoftplus_384(num_tokens, topk, route_scale=1.5):
     hip_ids = torch.empty_like(triton_ids)
 
     def run_triton():
-        sqrtsoftplus_384_topk(
-            gating_output, bias, triton_weights, triton_ids, route_scale
+        topk_gating(
+            triton_weights,
+            triton_ids,
+            gating_output,
+            bias,
+            True,
+            route_scale,
+            "sqrtsoftplus",
+            prefer_triton_384=True,
         )
         return triton_weights, triton_ids
 
@@ -554,6 +561,10 @@ def bench_sqrtsoftplus_384(num_tokens, topk, route_scale=1.5):
         )
         return hip_weights, hip_ids
 
+    # Without this the Triton column could time HIP: topk_gating falls back.
+    assert aiter.ops.topk._can_use_sqrtsoftplus_384_topk(
+        triton_weights, triton_ids, gating_output, bias
+    ), "topk_gating does not take the Triton kernel for this config"
     run_triton()
     run_hip()
     ret = {
