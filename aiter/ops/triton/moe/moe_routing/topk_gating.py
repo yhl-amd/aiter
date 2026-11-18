@@ -19,18 +19,16 @@ SQRTSOFTPLUS_384_EXPERTS = 384
 class SqrtSoftplus384Arch(NamedTuple):
     """How one arch runs the 384-expert sqrtsoftplus top-k."""
 
-    # The lane layout of the HIP kernel that topk_gating runs for 384 experts.
-    waves: int  # waves for each row
-    lanes: int  # lanes for each wave
-    ept: int  # experts for each lane
     # The most rows that topk_gating sends to the Triton kernel; the HIP kernel
     # takes larger calls.
     max_rows: int
 
 
-# Keyed by get_gfx_runtime(). The HIP kernel and its layout:
-# gfx950: topk_gating_kernel_opt, for all row counts; it is the faster one
-# above 2048 rows.
+# Keyed by get_gfx_runtime(). The kernel has one lane layout, that of
+# topk_gating_kernel_opt: one wave of 64 lanes, six experts in each lane.
+# gfx950 runs that HIP kernel for all row counts; it is the faster one above
+# 2048 rows. An arch whose HIP kernel has another layout needs its own kernel
+# path and test before it can have an entry.
 # No other arch is in the table. On gfx1250 the HIP single-wave kernel for 384
 # experts (topk_gating_kernel_opt_vwave) is at least as fast as the Triton
 # kernel; gfx1250-strict and gfx942 have not been measured.
@@ -38,7 +36,7 @@ class SqrtSoftplus384Arch(NamedTuple):
 # prefer_triton_384=True, such as a CUDA graph capture: an eager Triton launch
 # costs more host time than the kernel saves. Every other call runs HIP.
 SQRTSOFTPLUS_384_ARCHS = {
-    "gfx950": SqrtSoftplus384Arch(1, 64, 6, 2048),
+    "gfx950": SqrtSoftplus384Arch(max_rows=2048),
 }
 
 
@@ -77,7 +75,6 @@ def exact_sigmoid_biased_topk(
 
 
 def _sqrtsoftplus_384_topk_launch(
-    arch: SqrtSoftplus384Arch,
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor | None,
     topk_weights: torch.Tensor,
@@ -93,11 +90,11 @@ def _sqrtsoftplus_384_topk_launch(
     num_valid_rows get ids -1 and weights 0.
 
     Private: topk_gating(..., prefer_triton_384=True) is the entry point. It
-    checks the limits below and sends any other call to HIP. Limits: arch is
-    the SQRTSOFTPLUS_384_ARCHS entry of the device, BF16 gating_output of
-    [rows, 384] with unit column stride and 1 to arch.max_rows rows, an FP32
-    bias of [384] or None, FP32 topk_weights and INT32 topk_ids of
-    [rows, topk] with unit column stride and topk from 1 to 8.
+    checks the limits below and sends any other call to HIP. Limits: a device
+    arch in SQRTSOFTPLUS_384_ARCHS, BF16 gating_output of [rows, 384] with
+    unit column stride and 1 to max_rows rows, an FP32 bias of [384] or None,
+    FP32 topk_weights and INT32 topk_ids of [rows, topk] with unit column
+    stride and topk from 1 to 8.
     """
     if num_valid_rows is not None and (
         num_valid_rows.dtype != torch.int32 or num_valid_rows.numel() < 1
@@ -120,8 +117,5 @@ def _sqrtsoftplus_384_topk_launch(
         TOPK_PAD=triton.next_power_of_2(topk),
         HAS_BIAS=correction_bias is not None,
         HAS_NUM_VALID_ROWS=num_valid_rows is not None,
-        WAVES=arch.waves,
-        LANES=arch.lanes,
-        EPT=arch.ept,
         num_warps=1,
     )

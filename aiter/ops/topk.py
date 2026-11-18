@@ -124,8 +124,9 @@ def _runtime_sqrtsoftplus_384_arch():
 
 _UNSET = object()
 # _runtime_sqrtsoftplus_384_arch(), set at the first call that asks for the
-# Triton 384-expert top-k: importing aiter needs no GPU, and later calls neither
-# import the Triton module nor query the arch.
+# Triton 384-expert top-k, so importing aiter needs no GPU. Only the arch query
+# is cached: each such call still runs the function-level launcher import in
+# topk_gating.
 _sqrtsoftplus_384_arch = _UNSET
 
 
@@ -324,7 +325,6 @@ def topk_gating(
         )
 
         _sqrtsoftplus_384_topk_launch(
-            _sqrtsoftplus_384_arch,
             gating_output,
             correction_bias if correction_bias.numel() else None,
             topk_weights,

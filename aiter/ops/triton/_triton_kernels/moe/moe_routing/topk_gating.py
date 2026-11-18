@@ -138,7 +138,7 @@ def _pick6(cursor, a0, a1, a2, a3, a4, a5, other):
 
 _sqrtsoftplus_384_topk_repr = make_kernel_repr(
     "_sqrtsoftplus_384_topk",
-    ["TOPK", "HAS_BIAS", "HAS_NUM_VALID_ROWS", "WAVES", "LANES", "EPT"],
+    ["TOPK", "HAS_BIAS", "HAS_NUM_VALID_ROWS"],
 )
 
 
@@ -157,120 +157,63 @@ def _sqrtsoftplus_384_topk(
     TOPK_PAD: tl.constexpr,  # next power of two of TOPK
     HAS_BIAS: tl.constexpr,
     HAS_NUM_VALID_ROWS: tl.constexpr,
-    WAVES: tl.constexpr,
-    LANES: tl.constexpr,
-    EPT: tl.constexpr,
 ):
     """Renormalized sqrtsoftplus top-k of one row of 384 experts.
 
-    Uses the lane layout of the HIP kernel that topk_gating runs for 384
-    experts. Lane c of the C = WAVES * LANES lanes holds experts c, c + C, ...
-    and sorts them with the same network. Each wave takes TOPK rounds of a lane
-    argmax (lowest lane on a tie). The wave lists are then merged with a strict
-    compare, wave 0 first. So the ids, the tie order and the renorm sum order
-    are the same as there.
+    Uses the lane layout of topk_gating_kernel_opt, the HIP kernel that
+    topk_gating runs for 384 experts on gfx950: one wave of 64 lanes, and lane
+    c holds experts c, c + 64, ..., c + 320 and sorts them with
+    sort_network_desc<6>. TOPK rounds of a lane argmax (lowest lane on a tie)
+    then select the experts. So the ids, the tie order and the renorm sum
+    order are the same as there.
     """
-    tl.static_assert(EPT == 3 or EPT == 6, "EPT must be 3 or 6")
-    # idx & (LANES - 1) finds the lane that holds expert idx.
-    tl.static_assert((LANES & (LANES - 1)) == 0, "LANES must be a power of two")
-    tl.static_assert(WAVES * LANES * EPT == 384, "the lanes must hold 384 experts")
-    C: tl.constexpr = WAVES * LANES
+    LANES: tl.constexpr = 64
     row = tl.program_id(0)
     row_ptr = logits_ptr + row * stride_logits
-    cols = tl.arange(0, C)
-    s0, w0, i0 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, cols, HAS_BIAS)
-    s1, w1, i1 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, cols + C, HAS_BIAS)
-    s2, w2, i2 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, cols + 2 * C, HAS_BIAS)
-    if EPT == 3:
-        # sort_network_desc<3>
-        s0, w0, i0, s1, w1, i1 = _compare_exchange(s0, w0, i0, s1, w1, i1)
-        s0, w0, i0, s2, w2, i2 = _compare_exchange(s0, w0, i0, s2, w2, i2)
-        s1, w1, i1, s2, w2, i2 = _compare_exchange(s1, w1, i1, s2, w2, i2)
-    else:
-        s3, w3, i3 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, cols + 3 * C, HAS_BIAS)
-        s4, w4, i4 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, cols + 4 * C, HAS_BIAS)
-        s5, w5, i5 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, cols + 5 * C, HAS_BIAS)
-        # sort_network_desc<6>: its 12 comparators in order
-        s0, w0, i0, s1, w1, i1 = _compare_exchange(s0, w0, i0, s1, w1, i1)
-        s2, w2, i2, s3, w3, i3 = _compare_exchange(s2, w2, i2, s3, w3, i3)
-        s4, w4, i4, s5, w5, i5 = _compare_exchange(s4, w4, i4, s5, w5, i5)
-        s0, w0, i0, s2, w2, i2 = _compare_exchange(s0, w0, i0, s2, w2, i2)
-        s1, w1, i1, s4, w4, i4 = _compare_exchange(s1, w1, i1, s4, w4, i4)
-        s3, w3, i3, s5, w5, i5 = _compare_exchange(s3, w3, i3, s5, w5, i5)
-        s0, w0, i0, s1, w1, i1 = _compare_exchange(s0, w0, i0, s1, w1, i1)
-        s2, w2, i2, s3, w3, i3 = _compare_exchange(s2, w2, i2, s3, w3, i3)
-        s4, w4, i4, s5, w5, i5 = _compare_exchange(s4, w4, i4, s5, w5, i5)
-        s1, w1, i1, s2, w2, i2 = _compare_exchange(s1, w1, i1, s2, w2, i2)
-        s3, w3, i3, s4, w4, i4 = _compare_exchange(s3, w3, i3, s4, w4, i4)
-        s2, w2, i2, s3, w3, i3 = _compare_exchange(s2, w2, i2, s3, w3, i3)
-
-    cursor = tl.zeros([C], dtype=tl.int32)
     lane = tl.arange(0, LANES)
+    s0, w0, i0 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, lane, HAS_BIAS)
+    s1, w1, i1 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, lane + LANES, HAS_BIAS)
+    s2, w2, i2 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, lane + 2 * LANES, HAS_BIAS)
+    s3, w3, i3 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, lane + 3 * LANES, HAS_BIAS)
+    s4, w4, i4 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, lane + 4 * LANES, HAS_BIAS)
+    s5, w5, i5 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, lane + 5 * LANES, HAS_BIAS)
+    # sort_network_desc<6>: its 12 comparators in order
+    s0, w0, i0, s1, w1, i1 = _compare_exchange(s0, w0, i0, s1, w1, i1)
+    s2, w2, i2, s3, w3, i3 = _compare_exchange(s2, w2, i2, s3, w3, i3)
+    s4, w4, i4, s5, w5, i5 = _compare_exchange(s4, w4, i4, s5, w5, i5)
+    s0, w0, i0, s2, w2, i2 = _compare_exchange(s0, w0, i0, s2, w2, i2)
+    s1, w1, i1, s4, w4, i4 = _compare_exchange(s1, w1, i1, s4, w4, i4)
+    s3, w3, i3, s5, w5, i5 = _compare_exchange(s3, w3, i3, s5, w5, i5)
+    s0, w0, i0, s1, w1, i1 = _compare_exchange(s0, w0, i0, s1, w1, i1)
+    s2, w2, i2, s3, w3, i3 = _compare_exchange(s2, w2, i2, s3, w3, i3)
+    s4, w4, i4, s5, w5, i5 = _compare_exchange(s4, w4, i4, s5, w5, i5)
+    s1, w1, i1, s2, w2, i2 = _compare_exchange(s1, w1, i1, s2, w2, i2)
+    s3, w3, i3, s4, w4, i4 = _compare_exchange(s3, w3, i3, s4, w4, i4)
+    s2, w2, i2, s3, w3, i3 = _compare_exchange(s2, w2, i2, s3, w3, i3)
+
+    cursor = tl.zeros([LANES], dtype=tl.int32)
     slots = tl.arange(0, TOPK_PAD)
     out_w = tl.zeros([TOPK_PAD], dtype=tl.float32)
     out_i = tl.zeros([TOPK_PAD], dtype=tl.int32)
     weight_sum = 0.0
-    wave_v = tl.zeros([WAVES, TOPK_PAD], dtype=tl.float32)
-    wave_w = tl.zeros([WAVES, TOPK_PAD], dtype=tl.float32)
-    wave_i = tl.zeros([WAVES, TOPK_PAD], dtype=tl.int32)
-    # Each wave: TOPK rounds of a lane argmax over the heads of the lane lists.
+    # TOPK rounds of a lane argmax over the heads of the lane lists.
     for k in tl.static_range(TOPK):
-        if EPT == 3:
-            head_v = _pick3(cursor, s0, s1, s2, float("-inf"))
-            head_w = _pick3(cursor, w0, w1, w2, 0.0)
-            head_i = _pick3(cursor, i0, i1, i2, 0)
-        else:
-            head_v = _pick6(cursor, s0, s1, s2, s3, s4, s5, float("-inf"))
-            head_w = _pick6(cursor, w0, w1, w2, w3, w4, w5, 0.0)
-            head_i = _pick6(cursor, i0, i1, i2, i3, i4, i5, 0)
-        head_v = tl.reshape(head_v, [WAVES, LANES])
-        head_w = tl.reshape(head_w, [WAVES, LANES])
-        head_i = tl.reshape(head_i, [WAVES, LANES])
-        wave_cursor = tl.reshape(cursor, [WAVES, LANES])
-        best = tl.max(head_v, axis=1)
-        tied = head_v == best[:, None]
+        head_v = _pick6(cursor, s0, s1, s2, s3, s4, s5, float("-inf"))
+        head_w = _pick6(cursor, w0, w1, w2, w3, w4, w5, 0.0)
+        head_i = _pick6(cursor, i0, i1, i2, i3, i4, i5, 0)
+        best = tl.max(head_v, axis=0)
         # NaN choices are -inf, so some lane always ties best.
-        win_lane = tl.min(tl.where(tied, lane[None, :], LANES), axis=1)
-        idx = tl.sum(tl.where(lane[None, :] == win_lane[:, None], head_i, 0), axis=1)
-        won = (wave_cursor < EPT) & (head_i == idx[:, None])
+        win_lane = tl.min(tl.where(head_v == best, lane, LANES), axis=0)
+        idx = tl.sum(tl.where(lane == win_lane, head_i, 0), axis=0)
+        won = (cursor < 6) & (head_i == idx)
         # The weight comes from the lane that holds expert idx.
-        owner = lane[None, :] == (idx & (LANES - 1))[:, None]
-        wt = tl.sum(tl.where(owner & won, head_w, 0.0), axis=1)
-        cursor = tl.reshape(wave_cursor + won.to(tl.int32), [C])
-        if WAVES == 1:
-            # One wave: its list is the result, summed in selection order.
-            wt1 = tl.sum(wt, axis=0)
-            weight_sum = weight_sum + wt1
-            out_w = tl.where(slots == k, wt1, out_w)
-            out_i = tl.where(slots == k, tl.sum(idx, axis=0), out_i)
-        else:
-            at_k = slots[None, :] == k
-            wave_v = tl.where(at_k, best[:, None], wave_v)
-            wave_w = tl.where(at_k, wt[:, None], wave_w)
-            wave_i = tl.where(at_k, idx[:, None], wave_i)
-    if WAVES > 1:
-        # Merge the wave lists: strict compare, wave 0 first.
-        waves = tl.arange(0, WAVES)
-        pos = tl.zeros([WAVES], dtype=tl.int32)
-        for k in tl.static_range(TOPK):
-            at_pos = slots[None, :] == pos[:, None]
-            head_v = tl.sum(tl.where(at_pos, wave_v, 0.0), axis=1)
-            head_w = tl.sum(tl.where(at_pos, wave_w, 0.0), axis=1)
-            head_i = tl.sum(tl.where(at_pos, wave_i, 0), axis=1)
-            best_v = tl.sum(tl.where(waves == 0, head_v, 0.0), axis=0)
-            best_wave = 0
-            for w in tl.static_range(1, WAVES):
-                v = tl.sum(tl.where(waves == w, head_v, 0.0), axis=0)
-                up = v > best_v
-                best_v = tl.where(up, v, best_v)
-                best_wave = tl.where(up, w, best_wave)
-            taken = waves == best_wave
-            wt = tl.sum(tl.where(taken, head_w, 0.0), axis=0)
-            eid = tl.sum(tl.where(taken, head_i, 0), axis=0)
-            pos = pos + taken.to(tl.int32)
-            weight_sum = weight_sum + wt
-            out_w = tl.where(slots == k, wt, out_w)
-            out_i = tl.where(slots == k, eid, out_i)
+        owner = lane == (idx & (LANES - 1))
+        wt = tl.sum(tl.where(owner & won, head_w, 0.0), axis=0)
+        cursor = cursor + won.to(tl.int32)
+        # Summed in selection order, as in the HIP kernel.
+        weight_sum = weight_sum + wt
+        out_w = tl.where(slots == k, wt, out_w)
+        out_i = tl.where(slots == k, idx, out_i)
 
     # The sum has the same floor as in the HIP kernels (RENORM_SUM_FLOOR).
     out_w = out_w * tl.math.div_rn(routed_scaling, tl.maximum(weight_sum, 1e-20))
