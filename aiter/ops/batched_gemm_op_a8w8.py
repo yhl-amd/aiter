@@ -497,8 +497,9 @@ def _fused_quant_tuned_kernel(
     """The kernelName of the preshuffle table's flydsl row for this shape, the
     row the bf16 entry runs, so both entries share the tuned tile. None (the
     runner's own choice) when there is no row, the row is not a flydsl one, or
-    it names a compute kernel (no fused quant epilogue; the runner rejects it
-    with ``y_scale_out``). Any other name is passed through as is: a name the
+    it names a compute kernel (the fused entry does not run tuned compute rows
+    yet; with no name the runner picks the tile, the compute kernel for
+    prefill-sized M). Any other name is passed through as is: a name the
     flydsl runner does not accept raises there, as it does for the bf16 entry."""
     from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import is_compute_wmma_kernel_name
 

@@ -5,7 +5,7 @@
 ``_fused_quant_tuned_kernel`` looks the shape up in the same preshuffle table
 as ``batched_gemm_a8w8_mxscale_bpreshuffle`` and hands a flydsl row's
 kernelName to the runner as is. No row, an opus row, or a compute-kernel row
-(no fused quant epilogue) leaves the choice to the runner (None). CPU only: the
+leaves the choice to the runner (None). CPU only: the
 table lookup is patched, nothing launches.
 """
 
@@ -46,8 +46,8 @@ class TestFusedQuantTunedRow(unittest.TestCase):
         self.assertIsNone(self._pick(row))
 
     def test_compute_row_keeps_the_runner_choice(self):
-        # A DSv4.1 wo_a row of main's table; the compute kernel has no fused
-        # quant epilogue, so the fused entry runs the heuristic bmm tile.
+        # A DSv4.1 wo_a row of main's table; the fused entry does not run tuned
+        # compute rows yet, so it leaves the tile to the runner.
         row = {"libtype": "flydsl", "kernelName": _COMPUTE_NAME}
         self.assertIsNone(self._pick(row))
 
