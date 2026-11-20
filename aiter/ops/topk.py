@@ -37,6 +37,19 @@ _GFX1250_SIGMOID_EXPERTS = {512, 768, 896, 900, 1024}
 _GFX1250_SIGMOID_TOPKS = {4, 5, 8, 9, 16, 17}
 
 
+def _topk_outputs_ok(
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor, rows: int, topk: int
+) -> bool:
+    """FP32 weights and INT32 ids of [rows, topk] with unit column stride."""
+    return (
+        topk_weights.shape == topk_ids.shape == (rows, topk)
+        and (topk_weights.dtype, topk_ids.dtype) == (torch.float32, torch.int32)
+        and topk_weights.stride(1) == topk_ids.stride(1) == 1
+        and topk_weights.stride(0) >= topk
+        and topk_ids.stride(0) >= topk
+    )
+
+
 def _can_use_gfx1250_exact_sigmoid_topk(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -68,13 +81,7 @@ def _can_use_gfx1250_exact_sigmoid_topk(
         and correction_bias.dtype in (torch.bfloat16, torch.float32)
         and correction_bias.stride(0) == 1
     )
-    outputs_ok = (
-        topk_weights.shape == topk_ids.shape == (rows, topk)
-        and (topk_weights.dtype, topk_ids.dtype) == (torch.float32, torch.int32)
-        and topk_weights.stride(1) == topk_ids.stride(1) == 1
-        and topk_weights.stride(0) >= topk
-        and topk_ids.stride(0) >= topk
-    )
+    outputs_ok = _topk_outputs_ok(topk_weights, topk_ids, rows, topk)
     same_device = (
         correction_bias.device
         == topk_weights.device
@@ -105,6 +112,60 @@ def _gfx1250_exact_sigmoid_topk(
         need_renorm,
         routed_scaling_factor,
         num_valid_rows,
+    )
+
+
+def _runtime_sqrtsoftplus_384_arch():
+    """The SQRTSOFTPLUS_384_ARCHS entry of the runtime arch, or None."""
+    from .triton.moe.moe_routing.topk_gating import SQRTSOFTPLUS_384_ARCHS
+
+    return SQRTSOFTPLUS_384_ARCHS.get(get_gfx_runtime())
+
+
+_UNSET = object()
+# The SQRTSOFTPLUS_384_ARCHS entry of the runtime arch, or None. It is set by
+# the first topk_gating call that reaches _can_use_sqrtsoftplus_384_topk, so
+# importing aiter needs no GPU. _UNSET is truthy and None is not: off the table
+# arches, a topk_gating call ends the 384-expert check at its first test. Only
+# the arch query is cached; each Triton call still runs the launcher import.
+_sqrtsoftplus_384_arch = _UNSET
+
+
+def _can_use_sqrtsoftplus_384_topk(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+) -> bool:
+    """Whether the Triton 384-expert sqrtsoftplus top-k gives this call's result.
+
+    topk_gating has checked the cached arch entry, score_func ==
+    "sqrtsoftplus", need_renorm, no shared columns and
+    gating_output.shape[-1] == 384.
+    """
+    global _sqrtsoftplus_384_arch
+    arch = _sqrtsoftplus_384_arch
+    if arch is _UNSET:
+        arch = _sqrtsoftplus_384_arch = _runtime_sqrtsoftplus_384_arch()
+    if arch is None or gating_output.ndim != 2:
+        return False
+    rows = gating_output.shape[0]
+    if not 1 <= rows <= arch.max_rows:
+        return False
+    if topk_indices.ndim != 2 or not 1 <= topk_indices.shape[1] <= 8:
+        return False
+    return (
+        gating_output.dtype == torch.bfloat16
+        and gating_output.stride(1) == 1
+        and (
+            correction_bias.numel() == 0
+            or (
+                correction_bias.dtype == torch.float32
+                and correction_bias.shape == (384,)
+                and correction_bias.stride(0) == 1
+            )
+        )
+        and _topk_outputs_ok(topk_weights, topk_indices, rows, topk_indices.shape[1])
     )
 
 
@@ -239,6 +300,32 @@ def topk_gating(
             need_renorm,
             routed_scaling_factor,
             score_func,
+            num_valid_rows,
+        )
+        return
+    # 384-expert sqrtsoftplus on an arch in SQRTSOFTPLUS_384_ARCHS: a Triton
+    # kernel bit-identical to the HIP one. The arch entry is the first test, so
+    # a call on any other arch ends here.
+    if (
+        _sqrtsoftplus_384_arch
+        and score_func == "sqrtsoftplus"
+        and need_renorm
+        and num_shared_experts == 0
+        and gating_output.shape[-1] == 384
+        and _can_use_sqrtsoftplus_384_topk(
+            topk_weights, topk_indices, gating_output, correction_bias
+        )
+    ):
+        from .triton.moe.moe_routing.topk_gating import (
+            _sqrtsoftplus_384_topk_launch,
+        )
+
+        _sqrtsoftplus_384_topk_launch(
+            gating_output,
+            correction_bias if correction_bias.numel() else None,
+            topk_weights,
+            topk_indices,
+            routed_scaling_factor,
             num_valid_rows,
         )
         return
