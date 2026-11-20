@@ -37,6 +37,19 @@ _GFX1250_SIGMOID_EXPERTS = {512, 768, 896, 900, 1024}
 _GFX1250_SIGMOID_TOPKS = {4, 5, 8, 9, 16, 17}
 
 
+def _topk_outputs_ok(
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor, rows: int, topk: int
+) -> bool:
+    """FP32 weights and INT32 ids of [rows, topk] with unit column stride."""
+    return (
+        topk_weights.shape == topk_ids.shape == (rows, topk)
+        and (topk_weights.dtype, topk_ids.dtype) == (torch.float32, torch.int32)
+        and topk_weights.stride(1) == topk_ids.stride(1) == 1
+        and topk_weights.stride(0) >= topk
+        and topk_ids.stride(0) >= topk
+    )
+
+
 def _can_use_gfx1250_exact_sigmoid_topk(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -68,13 +81,7 @@ def _can_use_gfx1250_exact_sigmoid_topk(
         and correction_bias.dtype in (torch.bfloat16, torch.float32)
         and correction_bias.stride(0) == 1
     )
-    outputs_ok = (
-        topk_weights.shape == topk_ids.shape == (rows, topk)
-        and (topk_weights.dtype, topk_ids.dtype) == (torch.float32, torch.int32)
-        and topk_weights.stride(1) == topk_ids.stride(1) == 1
-        and topk_weights.stride(0) >= topk
-        and topk_ids.stride(0) >= topk
-    )
+    outputs_ok = _topk_outputs_ok(topk_weights, topk_ids, rows, topk)
     same_device = (
         correction_bias.device
         == topk_weights.device
@@ -105,6 +112,58 @@ def _gfx1250_exact_sigmoid_topk(
         need_renorm,
         routed_scaling_factor,
         num_valid_rows,
+    )
+
+
+def _runtime_sqrtsoftplus_384_arch():
+    """The SQRTSOFTPLUS_384_ARCHS entry of the runtime arch, or None."""
+    from .triton.moe.moe_routing.topk_gating import SQRTSOFTPLUS_384_ARCHS
+
+    return SQRTSOFTPLUS_384_ARCHS.get(get_gfx_runtime())
+
+
+_UNSET = object()
+# _runtime_sqrtsoftplus_384_arch(), set at the first topk_gating_sqrtsoftplus_384
+# call, so importing aiter needs no GPU. Only the arch query is cached: each
+# call still runs the function-level launcher import there.
+_sqrtsoftplus_384_arch = _UNSET
+
+
+def _can_use_sqrtsoftplus_384_topk(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor | None,
+) -> bool:
+    """Whether the Triton 384-expert sqrtsoftplus top-k gives this call's result.
+
+    The caller has checked score_func == "sqrtsoftplus", need_renorm, no shared
+    columns and gating_output.shape[-1] == 384.
+    """
+    global _sqrtsoftplus_384_arch
+    arch = _sqrtsoftplus_384_arch
+    if arch is _UNSET:
+        arch = _sqrtsoftplus_384_arch = _runtime_sqrtsoftplus_384_arch()
+    if arch is None or gating_output.ndim != 2:
+        return False
+    rows = gating_output.shape[0]
+    if not 1 <= rows <= arch.max_rows:
+        return False
+    if topk_indices.ndim != 2 or not 1 <= topk_indices.shape[1] <= 8:
+        return False
+    return (
+        gating_output.dtype == torch.bfloat16
+        and gating_output.stride(1) == 1
+        and (
+            correction_bias is None
+            or correction_bias.numel() == 0
+            or (
+                correction_bias.dtype == torch.float32
+                and correction_bias.shape == (384,)
+                and correction_bias.stride(0) == 1
+            )
+        )
+        and _topk_outputs_ok(topk_weights, topk_indices, rows, topk_indices.shape[1])
     )
 
 
@@ -258,6 +317,69 @@ def topk_gating(
 # DEPRECATED: the kernel routes sigmoid and softmax as well, so the name is now
 # topk_gating.  Kept until callers migrate.
 topk_softplus = topk_gating
+
+
+def topk_gating_sqrtsoftplus_384(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor | None = None,
+    need_renorm: bool = True,
+    routed_scaling_factor: float = 1.0,
+    score_func: str = "sqrtsoftplus",
+    num_shared_experts: int = 0,
+    num_valid_rows: torch.Tensor | None = None,
+) -> None:
+    """topk_gating for a caller that captures CUDA graphs.
+
+    Takes the arguments of topk_gating and writes the same result. A
+    renormalized 384-expert sqrtsoftplus call without shared columns runs a
+    Triton kernel that is bit-identical to the HIP kernel, when the arch has
+    an entry in SQRTSOFTPLUS_384_ARCHS and the call fits its limits: BF16
+    gating_output of [rows, 384] with unit column stride and 1 to max_rows
+    rows, an FP32 bias of [384] or none, FP32 topk_weights and INT32
+    topk_indices of [rows, topk] with unit column stride, topk from 1 to 8.
+    Every other call goes to topk_gating, and so does every call when the
+    HERD opt-in (AITER_FLYDSL_USE_HERD) is on.
+
+    Use it where the host cost of the Triton launch does not count, such as
+    in a CUDA graph capture. Eager callers should call topk_gating.
+    """
+    if (
+        score_func == "sqrtsoftplus"
+        and need_renorm
+        and num_shared_experts == 0
+        and not _FLYDSL_USE_HERD
+        and gating_output.shape[-1] == 384
+        and _can_use_sqrtsoftplus_384_topk(
+            topk_weights, topk_indices, gating_output, correction_bias
+        )
+    ):
+        from .triton.moe.moe_routing.topk_gating import (
+            _sqrtsoftplus_384_topk_launch,
+        )
+
+        bias = correction_bias
+        _sqrtsoftplus_384_topk_launch(
+            gating_output,
+            bias if bias is not None and bias.numel() else None,
+            topk_weights,
+            topk_indices,
+            routed_scaling_factor,
+            num_valid_rows,
+        )
+        return
+    topk_gating(
+        topk_weights,
+        topk_indices,
+        gating_output,
+        correction_bias,
+        need_renorm,
+        routed_scaling_factor,
+        score_func,
+        num_shared_experts,
+        num_valid_rows,
+    )
 
 
 @compile_ops("module_moe_asm", fc_name="biased_grouped_topk", develop=True)
