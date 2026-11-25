@@ -24,6 +24,7 @@ from flydsl.expr.typing import Vector as Vec
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.utility import dtypes
 
+from ...communication_ops_host_utils import build_p2p_table
 from .. import communication_ops_utils as comm_ops
 
 # The combine accumulation uses the buffer instruction's SGPR soffset field, which the
@@ -33,7 +34,6 @@ from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
     FlyDSLDispatchCombineIntraNodeOp,
     _zeroed_sym,
-    build_p2p_table,
     group_major_capacity,
 )
 from ..kernels_common import ceildiv
