@@ -981,6 +981,16 @@ def compile_tdm_compact_plan(
                         )
                     _lds_barrier()
                 if warp < npes:
+                    if const_expr(use_tag):
+                        # Re-seal the row's first 32 dwords (wave 0 tagged them)
+                        # from the issuing wave itself before its TDM reads the
+                        # row. Even after s_wait_dscnt + the barrier, a TDM issued
+                        # by another wave has been seen to read that head before
+                        # wave 0's tag: the peer then spins on an untagged head
+                        # forever and its S1F never starts.
+                        seal = lds_hist + fx.Int64(lane_i) * fx.Int64(4)
+                        comm_ops.store_i32_lds(seal, comm_ops.load_i32_lds(seal) | tag)
+                        fx.rocdl.s_wait_dscnt(0)
                     peer_hist = lsa(warp, hist_off) + fx.Int64(rank * row_dwords * 4)
                     TDM.tdm_store(
                         TDM.tdm_group0(
